@@ -1,17 +1,27 @@
 package exporters
 
 import (
+	"bytes"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
+	"path/filepath"
 	"testing"
 
 	"log/slog"
 
+	clientutilsv2 "github.com/gophercloud/utils/v2/client"
+	clientconfigv2 "github.com/gophercloud/utils/v2/openstack/clientconfig"
 	"github.com/jarcoal/httpmock"
 	"github.com/openstack-exporter/openstack-exporter/utils"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -240,4 +250,192 @@ func TestOpenStackSuites(t *testing.T) {
 	suite.Run(t, &PlacementTestSuite{BaseOpenStackTestSuite: BaseOpenStackTestSuite{ServiceName: "placement"}})
 	suite.Run(t, &ManilaTestSuite{BaseOpenStackTestSuite: BaseOpenStackTestSuite{ServiceName: "sharev2"}})
 	suite.Run(t, &ObjectStoreTestSuite{BaseOpenStackTestSuite: BaseOpenStackTestSuite{ServiceName: "object-store"}})
+}
+
+func TestTransportFromCloudConfig(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	// The server's certificate serves as the CA and, with its key, as the client certificate.
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+	caFile := writeTempFile(t, "ca.pem", caPEM)
+	keyDER, err := x509.MarshalPKCS8PrivateKey(srv.TLS.Certificates[0].PrivateKey)
+	require.NoError(t, err)
+	keyFile := writeTempFile(t, "client.key", pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}))
+	badKeyFile := writeTempFile(t, "bad.key", []byte("not a key"))
+
+	verifyTrue, verifyFalse := true, false
+
+	reachesServer := func(t *testing.T, rt http.RoundTripper) {
+		t.Helper()
+		resp, err := (&http.Client{Transport: rt}).Get(srv.URL)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+	}
+
+	tests := []struct {
+		name    string
+		cloud   clientconfigv2.Cloud
+		osDebug bool
+		wantLog string
+		check   func(t *testing.T, rt http.RoundTripper, err error)
+	}{
+		{
+			// nil keeps the default transport, which httpmock intercepts in the exporter suites.
+			name:  "no TLS settings returns nil",
+			cloud: clientconfigv2.Cloud{Verify: &verifyTrue},
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				assert.Nil(t, rt)
+			},
+		},
+		{
+			name:  "nil verify is treated as true",
+			cloud: clientconfigv2.Cloud{},
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				assert.Nil(t, rt)
+			},
+		},
+		{
+			name:    "verify false skips certificate verification",
+			cloud:   clientconfigv2.Cloud{Verify: &verifyFalse},
+			wantLog: "SSL verification disabled on transport",
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				assert.True(t, tlsTransport(t, rt).TLSClientConfig.InsecureSkipVerify)
+				reachesServer(t, rt)
+			},
+		},
+		{
+			name:  "cacert file is trusted",
+			cloud: clientconfigv2.Cloud{Verify: &verifyTrue, CACertFile: caFile},
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				want, _ := x509.SystemCertPool()
+				if want == nil {
+					want = x509.NewCertPool()
+				}
+				want.AppendCertsFromPEM(caPEM)
+				assert.True(t, want.Equal(tlsTransport(t, rt).TLSClientConfig.RootCAs), "cacert adds to the system CAs")
+				reachesServer(t, rt)
+			},
+		},
+		{
+			name:  "cacert PEM contents are trusted",
+			cloud: clientconfigv2.Cloud{Verify: &verifyTrue, CACertFile: string(caPEM)},
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				tlsTransport(t, rt)
+				reachesServer(t, rt)
+			},
+		},
+		{
+			// Records existing behavior rather than endorsing it.
+			name:    "unreadable cacert is logged and the system roots are used",
+			cloud:   clientconfigv2.Cloud{Verify: &verifyTrue, CACertFile: filepath.Join(t.TempDir(), "missing.pem")},
+			wantLog: "Failed to include additional certificates to ca-trust",
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				assert.Nil(t, tlsTransport(t, rt).TLSClientConfig.RootCAs)
+			},
+		},
+		{
+			name:  "client cert and key are loaded",
+			cloud: clientconfigv2.Cloud{Verify: &verifyTrue, ClientCertFile: caFile, ClientKeyFile: keyFile},
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				certs := tlsTransport(t, rt).TLSClientConfig.Certificates
+				require.Len(t, certs, 1)
+				assert.Equal(t, srv.Certificate().Raw, certs[0].Certificate[0])
+			},
+		},
+		{
+			name:  "invalid client key returns an error",
+			cloud: clientconfigv2.Cloud{Verify: &verifyTrue, ClientCertFile: caFile, ClientKeyFile: badKeyFile},
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.Error(t, err)
+				assert.Nil(t, rt)
+			},
+		},
+		{
+			name:    "OS_DEBUG wraps the transport in a request logger",
+			cloud:   clientconfigv2.Cloud{Verify: &verifyTrue},
+			osDebug: true,
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				assert.IsType(t, &clientutilsv2.RoundTripper{}, rt)
+			},
+		},
+		{
+			// AuthenticatedClientV2 can't set the proxy through the OS_DEBUG wrapper.
+			name:    "OS_DEBUG with TLS settings keeps the proxy",
+			cloud:   clientconfigv2.Cloud{Verify: &verifyTrue, CACertFile: caFile},
+			osDebug: true,
+			check: func(t *testing.T, rt http.RoundTripper, err error) {
+				require.NoError(t, err)
+				require.IsType(t, &clientutilsv2.RoundTripper{}, rt)
+				tlsTransport(t, rt)
+				reachesServer(t, rt)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OS_DEBUG", "1")
+			if !tc.osDebug {
+				require.NoError(t, os.Unsetenv("OS_DEBUG"))
+			}
+
+			var logs bytes.Buffer
+			rt, err := transportFromCloudConfig(&tc.cloud, slog.New(slog.NewTextHandler(&logs, nil)))
+			tc.check(t, rt, err)
+			if tc.wantLog != "" {
+				assert.Contains(t, logs.String(), tc.wantLog)
+			}
+		})
+	}
+}
+
+func TestTransportFromCloudConfigWithReplacedDefaultTransport(t *testing.T) {
+	httpmock.Activate()
+	defer httpmock.DeactivateAndReset()
+	t.Setenv("OS_DEBUG", "")
+	require.NoError(t, os.Unsetenv("OS_DEBUG"))
+
+	verifyFalse := false
+	rt, err := transportFromCloudConfig(&clientconfigv2.Cloud{Verify: &verifyFalse}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	require.NoError(t, err)
+
+	// The fallback keeps the previous behavior plus the proxy.
+	tr, ok := rt.(*http.Transport)
+	require.True(t, ok, "expected *http.Transport, got %T", rt)
+	assert.True(t, tr.TLSClientConfig.InsecureSkipVerify)
+	assert.NotNil(t, tr.Proxy, "proxy from environment")
+	assert.False(t, tr.ForceAttemptHTTP2, "HTTP/2 stays off")
+}
+
+// tlsTransport unwraps the OS_DEBUG logger and checks that the default transport's settings were kept.
+func tlsTransport(t *testing.T, rt http.RoundTripper) *http.Transport {
+	t.Helper()
+	if debug, ok := rt.(*clientutilsv2.RoundTripper); ok {
+		rt = debug.Rt
+	}
+	tr, ok := rt.(*http.Transport)
+	require.True(t, ok, "expected *http.Transport, got %T", rt)
+	require.NotNil(t, tr.TLSClientConfig)
+	assert.NotNil(t, tr.Proxy, "proxy from environment")
+	assert.Positive(t, tr.TLSHandshakeTimeout, "TLS handshake timeout")
+	assert.False(t, tr.ForceAttemptHTTP2, "HTTP/2 stays off")
+	return tr
+}
+
+func writeTempFile(t *testing.T, name string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	return path
 }

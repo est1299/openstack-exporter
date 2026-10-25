@@ -217,7 +217,12 @@ The cloud credentials and identity configuration
 should use the [os-client-config](https://docs.openstack.org/os-client-config/latest/) format
 and can be specified with the `--os-client-config` flag (defaults to `/etc/openstack/clouds.yaml`).
 
-`cacert` can be a full path to a PEM encoded file or contents of a PEM encoded file.
+TLS settings from the cloud entry apply to every OpenStack API connection the exporter makes,
+including Keystone authentication and service autodetection at startup:
+
+* `cacert` is trusted in addition to the system CA certificates. It can be a full path to a PEM encoded file or contents of a PEM encoded file.
+* `cert` and `key` set a client certificate for mutual TLS. Each can be a path or PEM encoded contents. Both must be set; if only one is set, neither is used.
+* `verify: false` disables certificate verification.
 
 Current list of supported options can be seen in the following example
 configuration:
@@ -239,8 +244,18 @@ clouds:
     cacert: |
       ---- BEGIN CERTIFICATE ---
       ...
+    cert: /etc/openstack/client.crt  # client certificate for mutual TLS
+    key: /etc/openstack/client.key   # private key for the client certificate
     verify: true | false  // disable || enable SSL certificate verification
 ```
+
+If the exporter fails at startup with:
+
+* `x509: certificate signed by unknown authority`: check that `cacert` points to the CA that signed the Keystone certificate.
+  If `cacert` can't be read, the exporter logs `Failed to include additional certificates to ca-trust` and uses the system CA certificates.
+* `tls: certificate required` (TLS 1.3), `tls: handshake failure` (TLS 1.2), or an HTTP 400 response such as nginx's `No required SSL certificate was sent`:
+  Keystone, or a proxy in front of it, may require a client certificate; set `cert` and `key`.
+* `tls: failed to find any PEM data in certificate input` (or `key input`): `cert` or `key` is neither a readable file nor PEM contents. Check the path.
 
 ### OpenStack Domain filtering
 

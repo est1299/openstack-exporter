@@ -218,8 +218,13 @@ func getEnabledServicesFromStates(serviceStates map[string]serviceState) []strin
 }
 
 func autodetectServices(cloud string, logger *slog.Logger) ([]string, error) {
+	transport, err := exporters.NewTransportForCloud(cloud, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	opts := &clientconfigv2.ClientOpts{Cloud: cloud}
-	services, err := exporters.AutodetectServicesFromCatalog(opts, nil, *endpointType)
+	services, err := exporters.AutodetectServicesFromCatalog(opts, transport, *endpointType)
 	if err != nil {
 		return nil, err
 	}
