@@ -257,21 +257,23 @@ func pathOrContents(poc string) ([]byte, bool, error) {
 	return []byte(poc), false, nil
 }
 
-func NewExporter(name, prefix, cloud string, disabledMetrics []string, endpointType string, collectTime bool, disableSlowMetrics bool, disableDeprecatedMetrics bool, disableCinderAgentUUID bool, domainID string, tenantID string, novaMetadataMapping *utils.LabelMappingFlag, dnsConcurrentCount int, uuidGenFunc func() (string, error), logger *slog.Logger) (OpenStackExporter, error) {
-	var exporter OpenStackExporter
-	var err error
-	var transport http.RoundTripper
-	var tlsConfig tls.Config
-
-	optsv2 := clientconfigv2.ClientOpts{Cloud: cloud}
-
-	config, err := clientconfigv2.GetCloudFromYAML(&optsv2)
+// NewTransportForCloud returns the transport for the cloud's clouds.yaml TLS settings and OS_DEBUG, or nil if neither applies.
+func NewTransportForCloud(cloud string, logger *slog.Logger) (http.RoundTripper, error) {
+	config, err := clientconfigv2.GetCloudFromYAML(&clientconfigv2.ClientOpts{Cloud: cloud})
 	if err != nil {
 		return nil, err
 	}
 
+	return transportFromCloudConfig(config, logger)
+}
+
+// transportFromCloudConfig returns a new transport per call: AuthenticatedClientV2 mutates it, so it must not be shared.
+func transportFromCloudConfig(config *clientconfigv2.Cloud, logger *slog.Logger) (http.RoundTripper, error) {
+	var transport http.RoundTripper
+	var tlsConfig tls.Config
+
 	var configureTransport = false
-	if !*config.Verify {
+	if config.Verify != nil && !*config.Verify {
 		logger.Info("SSL verification disabled on transport")
 		tlsConfig.InsecureSkipVerify = true
 		configureTransport = true
@@ -303,7 +305,7 @@ func NewExporter(name, prefix, cloud string, disabledMetrics []string, endpointT
 		configureTransport = true
 	}
 	if configureTransport {
-		transport = &http.Transport{TLSClientConfig: &tlsConfig}
+		transport = newTLSTransport(&tlsConfig)
 	}
 
 	if _, ok := os.LookupEnv("OS_DEBUG"); ok {
@@ -315,6 +317,35 @@ func NewExporter(name, prefix, cloud string, disabledMetrics []string, endpointT
 			Rt:     transport,
 			Logger: &clientutilsv2.DefaultLogger{},
 		}
+	}
+
+	return transport, nil
+}
+
+// newTLSTransport clones the default transport so its proxy and timeouts survive the OS_DEBUG wrapper.
+func newTLSTransport(tlsConfig *tls.Config) *http.Transport {
+	tr, ok := http.DefaultTransport.(*http.Transport)
+	if ok {
+		tr = tr.Clone()
+	} else {
+		// http.DefaultTransport may have been replaced (httpmock does this in tests); keep the previous behavior plus the proxy.
+		tr = &http.Transport{Proxy: http.ProxyFromEnvironment}
+	}
+	tr.TLSClientConfig = tlsConfig
+	// The default transport forces HTTP/2; keep HTTP/1.1, as before.
+	tr.ForceAttemptHTTP2 = false
+
+	return tr
+}
+
+func NewExporter(name, prefix, cloud string, disabledMetrics []string, endpointType string, collectTime bool, disableSlowMetrics bool, disableDeprecatedMetrics bool, disableCinderAgentUUID bool, domainID string, tenantID string, novaMetadataMapping *utils.LabelMappingFlag, dnsConcurrentCount int, uuidGenFunc func() (string, error), logger *slog.Logger) (OpenStackExporter, error) {
+	var exporter OpenStackExporter
+
+	optsv2 := clientconfigv2.ClientOpts{Cloud: cloud}
+
+	transport, err := NewTransportForCloud(cloud, logger)
+	if err != nil {
+		return nil, err
 	}
 
 	clientV2, err := NewServiceClientV2(name, &optsv2, transport, endpointType)

@@ -285,6 +285,8 @@ func mapStatus(mapping map[string]int, current string) int {
 	return v
 }
 
+// AutodetectServicesFromCatalog returns the supported services in the catalog. Pass the transport from
+// NewTransportForCloud; a nil transport ignores the clouds.yaml TLS settings.
 func AutodetectServicesFromCatalog(opts *clientconfigv2.ClientOpts, transport http.RoundTripper, endpointType string) ([]string, error) {
 	providerClient, _, endpointOpts, err := newAuthenticatedProviderClient(opts, transport, endpointType)
 	if err != nil {
